@@ -1,0 +1,100 @@
+# Python environments and packaging
+.venv/
+venv/
+env/
+myenv/
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.egg-info/
+pip-wheel-metadata/
+.Python
+
+# Local configuration and secrets
+.env
+.env.*
+!.env.example
+!.env.template
+*.pem
+*.key
+*.p12
+*.pfx
+*.secret
+secrets/
+
+# Frontend dependencies and build output
+frontend/node_modules/
+frontend/.next/
+frontend/out/
+frontend/dist/
+frontend/coverage/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+
+# Test, tool, and notebook caches
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.cache/
+.coverage
+coverage.xml
+htmlcov/
+.tox/
+.hypothesis/
+.ipynb_checkpoints/
+
+# Runtime logs and temporary files
+*.log
+*.tmp
+*.temp
+tmp/
+temp/
+uploads/
+downloads/
+
+# OS/editor metadata
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+.idea/
+.vscode/
+
+# Local AI workflow files
+AGENTS.md
+TASKS.md
+WORKLOG.md
+
+# Training outputs and experiment logs
+runs/
+wandb/
+logs/
+results/
+checkpoints/
+tensorboard/
+events.out.tfevents.*
+
+# Large model weights: distribute separately
+*.safetensors
+*.ckpt
+*.onnx
+*.pt
+*.pth
+*.bin
+
+# Local model/download caches
+.cache/huggingface/
+.cache/torch/
+ai/bart_model/**/runs/
+
+# Historical BART training checkpoints
+ai/bart_model/**/checkpoint-*/
+
+# Internal reverse-engineering notes
+docs/reverse-engineering/
+
+# Local backup files
+*.backup
