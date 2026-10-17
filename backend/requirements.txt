@@ -1,0 +1,31 @@
+# Core FastAPI dependencies
+fastapi>=0.115.0,<0.116.0
+uvicorn[standard]>=0.30.0,<0.31.0
+python-multipart>=0.0.9,<0.1.0
+
+# Database
+pymongo>=4.8.0,<5.0.0
+
+# Configuration
+pydantic>=2.8.0,<3.0.0
+pydantic-settings>=2.6.0,<3.0.0
+python-dotenv>=1.0.0
+
+# Audio processing
+pydub>=0.25.1,<0.26.0
+SpeechRecognition>=3.10.0,<4.0.0
+python-jose[cryptography]>=3.3.0,<4.0.0
+passlib[bcrypt]>=1.7.4,<2.0.0
+
+# AI/ML dependencies (for Whisper ASR - optional, will use fallback if not available)
+# Uncomment these if you want to enable Whisper ASR on Hugging Face Spaces
+# Note: This will increase Docker image size significantly and requires more resources
+
+# torch>=2.4.0,<3.0.0
+# torchaudio>=2.4.0,<3.0.0
+# openai-whisper>=20231117
+# transformers>=4.44.0,<5.0.0
+# pyannote.audio>=3.3.1,<4.0.0
+# librosa>=0.10.1,<0.11.0
+# numpy>=1.23.0
+# scipy>=1.10.0

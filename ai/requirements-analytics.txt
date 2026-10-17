@@ -1,0 +1,18 @@
+# Analytics System - Required Packages
+
+## Python Backend Packages
+cohere>=4.0.0
+pymongo>=4.0.0
+matplotlib>=3.5.0
+plotly>=5.0.0
+pandas>=1.5.0
+numpy>=1.23.0
+seaborn>=0.12.0
+
+# Already in requirements.txt but needed for analytics:
+# fastapi
+# uvicorn
+# pydantic
+
+## Installation
+# pip install cohere pymongo matplotlib plotly pandas numpy seaborn
