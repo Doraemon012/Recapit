@@ -217,7 +217,7 @@ Training uses the standard encoder-decoder teacher-forcing objective implemented
 
 ### Datasets
 
-The notebook loads `edinburghcstr/ami` (`ihm` configuration) first, then falls back to `knkarthick/dialogsum` and `samsum` if earlier loading fails. A column-selection step picks the transcript and summary columns for tokenization.
+The notebook loads `edinburghcstr/ami` (`ihm` configuration). A column-selection step picks the transcript and summary columns for tokenization.
 
 ### Preprocessing and tokenization
 
