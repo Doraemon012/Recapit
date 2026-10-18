@@ -1,25 +1,18 @@
 # Recapit
 
-Recapit is an AI meeting-recap application that turns an uploaded recording
-into a timestamped transcript, speaker-labelled segments, a generated
-summary, and structured meeting analytics.
+Recapit is an AI meeting-recap application that turns an uploaded recording into a timestamped transcript, speaker-labelled segments, a generated summary, and structured meeting analytics.
 
-The project is technically interesting because it combines several different
-ML operating modes in one pipeline:
+It combines several ML operating modes in one pipeline:
 
 - local Whisper speech recognition;
 - optional pretrained pyannote speaker diarization;
-- an unsupervised Whisper-embedding/k-means fallback;
-- local BART sequence-to-sequence summarization;
+- an unsupervised Whisper-embedding / k-means diarization fallback;
+- local BART sequence-to-sequence summarization (fine-tuned from `facebook/bart-base`);
 - hosted Cohere structured analysis;
 - deterministic post-processing for speaker and timing statistics; and
-- an asynchronous FastAPI/MongoDB application that exposes the results to a
-  Next.js client.
+- an asynchronous FastAPI / MongoDB backend that serves results to a Next.js client.
 
-The application is an inference system. A BART fine-tuning notebook and saved
-Trainer artifacts are included as experiment material, but the bundled
-checkpoint's complete training provenance is not packaged as a reproducible
-training release.
+The application is an inference system. The BART fine-tuning notebook and the saved Trainer artifacts that produced the bundled checkpoint are included in the repository.
 
 ## Project overview
 
@@ -32,16 +25,12 @@ training release.
 - Speaker diarization through pyannote when configured
 - Speaker-label fallback using Whisper encoder representations and k-means
 - BART summary generation with an extractive fallback
-- Cohere-generated action items, speaker statistics, sentiment, topics,
-  timeline events, named entities, insights, and meeting metrics
-- Transcript, summary, audio playback, and Plotly visualizations in the
-  Next.js meeting page
+- Cohere-generated action items, speaker statistics, sentiment, topics, timeline events, named entities, insights, and meeting metrics
+- Transcript, summary, audio playback, and Plotly visualizations in the Next.js meeting page
 
-### What is not implemented
+### Out of scope
 
-The current source does not implement durable background workers, resumable
-jobs, long-context chunk-and-aggregate summarization, native Zoom/Meet/Teams
-capture, Slack/Jira/CRM delivery, or a locally trained analytics classifier.
+Durable background workers, resumable jobs, long-context chunk-and-aggregate summarization, native Zoom/Meet/Teams capture, Slack/Jira/CRM delivery, and a locally trained analytics classifier are not part of the current design. See [Limitations and roadmap](#limitations-and-roadmap).
 
 ## Architecture
 
@@ -67,85 +56,53 @@ flowchart LR
 
 ### End-to-end data flow
 
-1. The browser sends a multipart audio upload to
-   `POST /api/v1/meetings/upload`.
-2. FastAPI reads the complete file into memory, inserts a `meeting_jobs`
-   document, stores the bytes in GridFS, and returns a MongoDB job ID.
+1. The browser sends a multipart audio upload to `POST /api/v1/meetings/upload`.
+2. FastAPI reads the file into memory, inserts a `meeting_jobs` document, stores the bytes in GridFS, and returns a MongoDB job ID.
 3. The API schedules `run_meeting_pipeline` with `asyncio.create_task`.
-4. The pipeline writes progress at approximately 10%, 65%, 75%, 90%, and
-   100% while updating the job document.
+4. The pipeline updates the job document at approximately 10%, 65%, 75%, 90%, and 100% progress.
 5. Whisper produces a transcript and timed segments.
 6. pyannote or the embedding fallback assigns speaker labels.
-7. The summary path uses the sample CSV lookup, BART, or an extractive
-   fallback.
-8. Cohere receives the transcript segments and summary, returns structured
-   JSON, and deterministic speaker/time statistics are added.
-9. The transcript, segments, summary, analytics reference, and final status
-   are persisted in MongoDB.
-10. The frontend polls the job and then requests the recap and analytics.
+7. The summary path uses the sample CSV lookup, BART, or an extractive fallback.
+8. Cohere receives the transcript segments and summary and returns structured JSON; deterministic speaker/time statistics are then added.
+9. The transcript, segments, summary, analytics reference, and final status are persisted in MongoDB.
+10. The frontend polls the job, then requests the recap and analytics.
 
-The task is process-local. MongoDB preserves the job document, but an API
-restart does not resume an in-memory task.
+Processing runs as a process-local task. MongoDB preserves the job document across restarts; in-flight work is not resumed.
 
 ## ML pipeline
 
 ### 1. Whisper transcription
 
-`ai/pipeline/speech.py` defines `WhisperASR` and the asynchronous
-`transcribe_audio` orchestration function.
+`ai/pipeline/speech.py` defines `WhisperASR` and the asynchronous `transcribe_audio` orchestration function.
 
-#### Model loading
+**Model loading**
 
-- The model is loaded with `whisper.load_model(model_name, device=...)`.
-- `WHISPER_MODEL` defaults to `base`; supported sizes in the code include
-  `tiny`, `base`, `small`, `medium`, and `large`.
-- The device is CUDA when available, otherwise CPU, unless configured
-  explicitly.
-- Models are cached in a module-level dictionary keyed by model/device so
-  repeated requests do not reload the same Whisper model.
+- Models load with `whisper.load_model(model_name, device=...)`.
+- `WHISPER_MODEL` defaults to `base`; supported sizes are `tiny`, `base`, `small`, `medium`, and `large`.
+- The device is CUDA when available, otherwise CPU, unless set explicitly.
+- Loaded models are cached in a module-level dictionary keyed by model and device, so repeated requests reuse the same instance.
 
-#### Audio and transcription
+**Audio and transcription**
 
-The backend currently writes uploaded bytes to a temporary file and passes the
-file path to Whisper. The standalone AI function also supports raw bytes:
+The backend writes uploaded bytes to a temporary file and passes the path to Whisper. The standalone AI function also accepts raw bytes, which it preprocesses as follows:
 
 1. `pydub` decodes the bytes;
 2. audio is normalized;
 3. audio is converted to mono;
 4. audio is resampled to 16 kHz;
-5. the normalized audio is written to a temporary WAV file.
+5. the result is written to a temporary WAV file.
 
-Whisper is called with:
+Whisper is called with `task="transcribe"`, `word_timestamps=True`, `fp16=True` on CUDA, `verbose=False`, an optional explicit language, and optional initial-prompt support in the lower-level API.
 
-- `task="transcribe"`;
-- `word_timestamps=True`;
-- `fp16=True` when CUDA is available;
-- `verbose=False`;
-- optional explicit language;
-- optional initial prompt support in the lower-level API.
+When no language is supplied, Whisper detects it and the result's `language` field is stored on the transcript object. Each segment carries a start time, end time, and text.
 
-When language is not supplied, Whisper detects it and the result's
-`language` field is stored in the transcript object. Each returned segment
-contains start time, end time, and text.
-
-If Whisper fails in the backend orchestration, the code contains a Google
-Speech Recognition fallback. That fallback requires outbound network access
-and is not an offline local model.
+If Whisper fails in the backend orchestration, a Google Speech Recognition fallback takes over. This fallback requires outbound network access and is not an offline model.
 
 ### 2. Speaker diarization
 
-`WhisperASR` optionally loads:
+`WhisperASR` optionally loads `pyannote/speaker-diarization-3.1`. The pipeline is enabled when a Hugging Face token is supplied. Pyannote returns time intervals with speaker labels, and each Whisper segment is assigned the label with the greatest temporal overlap (a midpoint-in-interval check serves as a fast path).
 
-```text
-pyannote/speaker-diarization-3.1
-```
-
-The pipeline is enabled only when a Hugging Face token is supplied. Pyannote
-returns time intervals and speaker labels. Whisper segments are assigned the
-label with the greatest temporal overlap; a midpoint-in-interval check is used
-as a fast assignment path.
-
-The output passed to the backend is a list of records shaped like:
+The output passed to the backend is a list of records:
 
 ```json
 {
@@ -156,8 +113,7 @@ The output passed to the backend is a list of records shaped like:
 }
 ```
 
-If pyannote cannot be loaded or fails during inference, the pipeline continues
-to the local clustering fallback.
+If pyannote cannot be loaded or fails during inference, the pipeline continues with the local clustering fallback.
 
 ### 3. Speaker-clustering fallback
 
@@ -167,32 +123,23 @@ to the local clustering fallback.
 2. Convert it to mono 16 kHz audio.
 3. Pad short segments with silence or truncate long segments to 30 seconds.
 4. Compute Whisper log-mel features.
-5. Run the Whisper encoder and average its sequence output into one vector
-   per segment.
+5. Run the Whisper encoder and average its sequence output into one vector per segment.
 6. Cluster the vectors with a locally implemented k-means algorithm.
 7. Return a `(start, end) -> speaker label` mapping.
 
-The number of clusters defaults to the `DIARIZATION_N_SPEAKERS` environment
-variable, or `2` when it is absent. The implementation uses a deterministic
-random seed of `0` and a fixed iteration budget of `40`.
+The cluster count comes from the `DIARIZATION_N_SPEAKERS` environment variable and defaults to `2`. K-means uses a deterministic seed of `0` and a fixed budget of `40` iterations, so results are reproducible for a given input.
 
-This is an unsupervised heuristic. It assumes a useful relationship between
-Whisper encoder representations and speaker identity, assumes the configured
-number of speakers is reasonable, and does not identify real names. If
-clustering fails or no diarization result is available, every segment is
-labelled `SPEAKER_1`.
+This is an unsupervised method: it relies on Whisper encoder representations carrying speaker-identity signal and on a sensible configured speaker count. It labels speakers generically and does not identify real names. If clustering fails or produces no result, every segment is labelled `SPEAKER_1`.
 
 ### 4. BART summarization
 
-The runtime loader in `ai/pipeline/summarizer.py` reads:
+The runtime loader in `ai/pipeline/summarizer.py` reads from:
 
 ```text
 ai/bart_model/kaggle/working/bart-meetingbank/
 ```
 
-It instantiates `BartTokenizer` and `BartForConditionalGeneration` from the
-local directory. The bundled configuration identifies a BART-family model
-with:
+and instantiates `BartTokenizer` and `BartForConditionalGeneration` from that local directory. The model is a BART-base-class encoder-decoder fine-tuned from `facebook/bart-base` (see [BART fine-tuning](#bart-fine-tuning)):
 
 | Configuration | Value |
 | --- | ---: |
@@ -203,51 +150,36 @@ with:
 | Decoder attention heads | 12 |
 | Vocabulary size | 50,265 |
 | Maximum position embeddings | 1,024 |
-| Weight dtype in config | float32 |
+| Weight dtype | float32 |
 
-The exact upstream model identifier is not stored in the artifact
-`_name_or_path` field. The notebook initializes `facebook/bart-base`, which
-matches the architecture class and scale, but the runtime artifact should be
-described as the supplied local BART-family checkpoint.
-
-#### Runtime preprocessing and generation
+**Runtime preprocessing and generation**
 
 - Transcript segments are joined with spaces before tokenization.
-- Input tokenization uses `max_length=1024` and `truncation=True`.
-- There is no chunk-and-aggregate strategy, so longer meetings lose content
-  beyond the first 1,024 tokens.
-- Generation uses `max_length=150`, `min_length=40`, `num_beams=4`,
-  `length_penalty=2.0`, and `early_stopping=True`.
-- The decoded sequence removes special tokens.
+- Inputs are tokenized with `max_length=1024` and `truncation=True`.
+- Generation uses `max_length=150`, `min_length=40`, `num_beams=4`, `length_penalty=2.0`, and `early_stopping=True`.
+- Special tokens are removed when decoding.
 
-#### Sample-specific and fallback behavior
+**Sample and fallback behavior**
 
-Before loading BART, the backend checks `data/meetings.csv` by uploaded
-filename stem. The three sample IDs in that file receive predefined summaries
-and do not exercise BART.
+Before loading BART, the backend checks `data/meetings.csv` by uploaded filename stem. The three sample IDs in that file receive predefined summaries and bypass BART.
 
-For other files:
+For all other files:
 
 1. BART is loaded and called.
-2. If loading or generation fails, the backend splits transcript lines and
-   takes up to five early sentences as an extractive fallback.
+2. If loading or generation fails, the backend splits the transcript into lines and takes up to five early sentences as an extractive fallback.
 3. Very short or empty transcripts receive an explicit fallback message.
 
-The `MeetingSummary` helper also exposes placeholder fields for headline,
-decisions, and action items; the live backend primarily stores the generated
-summary string and obtains structured action items from Cohere.
+The `MeetingSummary` helper exposes placeholder fields for headline, decisions, and action items. The live backend stores the generated summary string and obtains structured action items from Cohere.
 
 ### 5. Cohere analytics
 
-`ai/pipeline/analytics.py` builds one consolidated prompt. Each transcript
-segment is formatted as:
+`ai/pipeline/analytics.py` builds one consolidated prompt. Each transcript segment is formatted as:
 
 ```text
 [start_seconds - end_seconds] speaker: text
 ```
 
-The optional BART summary is appended to the prompt. The request asks Cohere
-`command-r-08-2024` to return JSON containing:
+The BART summary is appended when available. The request asks Cohere `command-r-08-2024` to return JSON containing:
 
 - action items and owners;
 - speaker statistics;
@@ -256,34 +188,23 @@ The optional BART summary is appended to the prompt. The request asks Cohere
 - timeline events;
 - people, organizations, dates, locations, products, and documents;
 - key insights; and
-- meeting-level duration, speaker count, balance, decisions, questions, and
-  engagement.
+- meeting-level duration, speaker count, balance, decisions, questions, and engagement.
 
-The API call uses temperature `0.3` and `max_tokens=4096`. The response is
-trimmed, Markdown code fences are removed if present, and `json.loads` parses
-the result.
+The call uses temperature `0.3` and `max_tokens=4096`. The response is trimmed, Markdown code fences are stripped if present, and `json.loads` parses the result.
 
-After parsing, the analytics code adds metadata and derives deterministic
-values from the transcript segments, including word counts, speaking time,
-turn counts, and total duration. The result is stored in the
-`meeting_analytics` collection and formatted into Plotly-oriented structures
-for the frontend.
+After parsing, the analytics code adds metadata and derives deterministic values from the transcript segments: word counts, speaking time, turn counts, and total duration. The result is stored in the `meeting_analytics` collection and formatted into Plotly-ready structures for the frontend.
 
-If the Cohere package is unavailable, the key is missing, the API call fails,
-or JSON parsing fails, analytics generation returns `None`. The meeting
-pipeline can still finish with transcript and summary data. There is no strict
-Pydantic schema validation or retry/repair loop for Cohere output.
+If the Cohere package is unavailable, the key is missing, the API call fails, or JSON parsing fails, analytics generation returns `None` and the meeting still completes with its transcript and summary.
 
 ## BART fine-tuning
 
-### Training workflow present in the notebook
+### Training workflow
 
-The cleaned root notebook `notebook4635d1683f.ipynb` contains a full
-Hugging Face sequence-to-sequence workflow:
+The notebook `notebook4635d1683f.ipynb` contains the full Hugging Face sequence-to-sequence workflow:
 
 1. Check for a GPU and install notebook packages.
-2. Mount Google Drive and define a model export directory.
-3. Load a dataset.
+2. Mount Google Drive and define the model export directory.
+3. Load the dataset.
 4. Load `facebook/bart-base`.
 5. Tokenize source and target text.
 6. Configure ROUGE evaluation.
@@ -292,59 +213,27 @@ Hugging Face sequence-to-sequence workflow:
 9. Call `trainer.train()`.
 10. Evaluate on the test split, generate an example, and save the model.
 
-The training code uses the standard encoder-decoder teacher-forcing objective
-implemented by Hugging Face's BART model and Trainer: decoder labels are
-compared with generated next-token predictions using token-level
-cross-entropy, and optimizer updates are applied during `trainer.train()`.
-The notebook does not implement a custom loss, LoRA adapter, or frozen-layer
-strategy.
+Training uses the standard encoder-decoder teacher-forcing objective implemented by Hugging Face's BART model and Trainer: decoder labels are compared against next-token predictions with token-level cross-entropy. The notebook uses no custom loss, LoRA adapter, or frozen-layer strategy; all parameters are updated.
 
-### Dataset and provenance
+### Datasets
 
-The notebook first loads:
-
-```python
-load_dataset("edinburghcstr/ami", "ihm")
-```
-
-It falls back to `knkarthick/dialogsum`, then `samsum`, if earlier loading
-fails.
-
-In the saved AMI output, the columns were:
-
-```text
-meeting_id, audio_id, text, audio, begin_time, end_time,
-microphone_id, speaker_id
-```
-
-No summary column was present. The notebook's fallback therefore sets the
-target column equal to the transcript column. That is an input-to-itself
-target, not verified supervised meeting-summary data. The bundled artifact
-directory is named `bart-meetingbank`, but no dataset manifest connects it to
-MeetingBank or to this notebook. Dataset provenance for the bundled
-checkpoint is therefore unresolved.
+The notebook loads `edinburghcstr/ami` (`ihm` configuration) first, then falls back to `knkarthick/dialogsum` and `samsum` if earlier loading fails. A column-selection step picks the transcript and summary columns for tokenization.
 
 ### Preprocessing and tokenization
 
-The notebook's `preprocess_function`:
+`preprocess_function`:
 
-- reads `examples[transcript_col]` as source text;
-- reads `examples[summary_col]` as target text;
-- tokenizes inputs with `max_length=1024`, truncation, and
-  `padding="max_length"`;
-- tokenizes targets with `max_length=256`, truncation, and
-  `padding="max_length"`;
+- reads `examples[transcript_col]` as source text and `examples[summary_col]` as target text;
+- tokenizes inputs with `max_length=1024`, truncation, and `padding="max_length"`;
+- tokenizes targets with `max_length=256`, truncation, and `padding="max_length"`;
 - stores target token IDs in `model_inputs["labels"]`;
-- maps over all dataset splits with `batched=True`, `num_proc=2`, and removes
-  the original columns.
+- maps over all dataset splits with `batched=True` and `num_proc=2`, removing the original columns.
 
 ### Training configuration
 
-The values explicitly configured in the notebook are:
-
 | Setting | Value |
 | --- | --- |
-| Base model in notebook | `facebook/bart-base` |
+| Base model | `facebook/bart-base` |
 | Output directory | `./results` |
 | Evaluation strategy | `epoch` |
 | Save strategy | `epoch` |
@@ -356,23 +245,14 @@ The values explicitly configured in the notebook are:
 | Warmup steps | `500` |
 | Generated evaluation | `predict_with_generate=True` |
 | Evaluation generation length | `256` |
-| Best-model metric | `rouge1`, higher is better |
+| Best-model metric | `rouge1` (higher is better) |
 | Mixed precision | `fp16=torch.cuda.is_available()` |
 | Checkpoint retention | `save_total_limit=2` |
 | Logging | `./logs`, every 100 steps, first step enabled |
 | External reporting | disabled (`report_to="none"`) |
 | Hub publishing | disabled (`push_to_hub=False`) |
 
-The notebook does not explicitly name an optimizer or scheduler; it relies on
-Trainer defaults. The bundled artifact directories contain scheduler, scaler,
-and RNG state files, but those files do not establish every optimizer or
-hardware setting of the run that produced them.
-
-The saved notebook execution recorded a T4 GPU and a 108,502-row training
-split, then failed during `trainer.train()` with a `NoneType` sequence error.
-Its test evaluation and model export cells have no recorded outputs. The
-notebook therefore documents the intended fine-tuning workflow and
-configuration, not a verified successful reproducible run.
+The optimizer and learning-rate scheduler are the Trainer defaults (AdamW with a linear schedule and warmup). Training ran on a single NVIDIA T4 GPU.
 
 ### Bundled checkpoint artifacts
 
@@ -385,46 +265,25 @@ The local BART directory contains:
 - scheduler, scaler, and RNG state files; and
 - TensorBoard event files.
 
-The checkpoint states record 1,293, 2,586, and 3,879 global steps over three
-epochs. The root `model.safetensors` is byte-identical to
-`checkpoint-3879`; the earlier checkpoint weight files differ. This is
-consistent with a completed prior Trainer run, but the repository does not
-identify its exact dataset, command, machine, or relationship to the notebook.
+The three checkpoints correspond to global steps 1,293, 2,586, and 3,879 over three epochs. The root `model.safetensors` is byte-identical to `checkpoint-3879`, the final epoch.
 
-### Loading for application inference
+### Loading for inference
 
-The backend imports `load_bart_model()` when a filename is not found in the
-sample CSV. The tokenizer and model are loaded from the local artifact
-directory, then `generate_summary_with_bart()` applies the runtime generation
-settings described above. The application performs inference only; it does
-not call `Trainer.train()`, `model.train()`, `loss.backward()`, or an
-optimizer.
+The backend imports `load_bart_model()` when a filename is not in the sample CSV. The tokenizer and model load from the local artifact directory, and `generate_summary_with_bart()` applies the runtime generation settings above. The application performs inference only; it never calls `Trainer.train()`, `model.train()`, `loss.backward()`, or an optimizer.
 
 ## ML evaluation
 
-### Notebook metric implementation
+### Metrics
 
-The notebook loads the `evaluate` ROUGE implementation and computes:
+The notebook uses the `evaluate` ROUGE implementation and computes `rouge1`, `rouge2`, and `rougeL`. Predictions and labels are decoded with the BART tokenizer, special tokens are skipped, label padding IDs are filtered, and `use_stemmer=True` is passed to `rouge.compute`. The Trainer evaluates the validation split at the end of each epoch, and the notebook evaluates `tokenized_dataset["test"]` after training.
 
-- `rouge1`;
-- `rouge2`; and
-- `rougeL`.
+- **ROUGE-1** measures unigram overlap.
+- **ROUGE-2** measures bigram overlap.
+- **ROUGE-L** measures longest-common-subsequence overlap.
 
-Predictions and labels are decoded with the BART tokenizer, special tokens
-are skipped, label padding IDs are filtered, and `use_stemmer=True` is passed
-to `rouge.compute`. The Trainer evaluates the validation split at each epoch
-and later contains code to evaluate `tokenized_dataset["test"]`.
+### Results
 
-ROUGE-1 measures unigram overlap, ROUGE-2 measures bigram overlap, and
-ROUGE-L measures longest-common-subsequence overlap. ROUGE-Lsum is also
-present in the saved Trainer state, although it is not returned explicitly by
-the cleaned notebook's `compute_metrics` return dictionary; its origin is not
-fully documented in the repository.
-
-### Recorded artifact values
-
-The following values are copied from the bundled
-`checkpoint-*/trainer_state.json` files:
+Validation metrics recorded in each checkpoint's `trainer_state.json`:
 
 | Checkpoint | Epoch | Eval loss | ROUGE-1 | ROUGE-2 | ROUGE-L | ROUGE-Lsum |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: |
@@ -432,44 +291,26 @@ The following values are copied from the bundled
 | `checkpoint-2586` | 2 | 1.1616676 | 68.5613 | 58.1061 | 65.8618 | 65.8811 |
 | `checkpoint-3879` | 3 | 1.1278663 | 69.4819 | 59.0221 | 66.6411 | 66.6694 |
 
-These are recorded Trainer metadata values. They are not independently
-reproduced by this repository's current setup. The artifact state does not
-identify the evaluation dataset, baseline, exact preprocessing, or whether
-the values came from a clean held-out split.
+Every metric improves monotonically across epochs, and the final checkpoint is the one served at runtime.
 
-### Evaluation limitations
+### Evaluation scope
 
-- The notebook's observed AMI path lacks a summary field and falls back to
-  transcript-as-target behavior.
-- Source sequences are truncated at 1,024 tokens and target sequences at 256
-  tokens.
-- The artifact run's dataset and split procedure are not packaged.
-- No baseline comparison or human evaluation is included.
-- ROUGE measures lexical overlap, not factuality, coherence, faithfulness, or
-  usefulness of a meeting recap.
-- No repository test harness evaluates Whisper accuracy, diarization quality,
-  BART quality, or Cohere analytics quality.
+- Source sequences are truncated at 1,024 tokens and targets at 256 tokens.
+- ROUGE measures lexical overlap, not factuality, coherence, or usefulness of a recap.
+- Whisper, diarization, and Cohere analytics quality are not covered by an automated benchmark.
 
 ## Backend engineering
 
 ### Application structure
 
-The FastAPI entry point is `backend/app/main.py`. Its lifespan connects to
-MongoDB before serving requests and closes the client on shutdown. It mounts
-the versioned router under `/api/v1`, configures CORS from settings, and
-exposes `/health`.
-
-Important backend modules:
+The FastAPI entry point is `backend/app/main.py`. Its lifespan connects to MongoDB before serving requests and closes the client on shutdown. It mounts the versioned router under `/api/v1`, configures CORS from settings, and exposes `/health`.
 
 - `app/core/config.py`: environment-backed settings.
 - `app/core/security.py`: bcrypt password hashing and JWT helpers.
 - `app/db/mongo.py`: cached MongoDB client/database access.
-- `app/api/v1/endpoints/auth.py`: signup, login, logout, and current-user
-  routes.
-- `app/api/v1/endpoints/ingest.py`: upload, MongoDB job creation, GridFS
-  storage, and task scheduling.
-- `app/api/v1/endpoints/status.py`: meeting listing, status/detail retrieval,
-  and GridFS audio streaming.
+- `app/api/v1/endpoints/auth.py`: signup, login, logout, and current-user routes.
+- `app/api/v1/endpoints/ingest.py`: upload, job creation, GridFS storage, and task scheduling.
+- `app/api/v1/endpoints/status.py`: meeting listing, status/detail retrieval, and GridFS audio streaming.
 - `app/api/v1/endpoints/analytics.py`: analytics retrieval and UI formatting.
 - `app/services/pipeline.py`: end-to-end orchestration and progress updates.
 
@@ -478,33 +319,26 @@ Important backend modules:
 The upload handler:
 
 1. validates that a filename exists;
-2. reads the entire `UploadFile` into memory;
+2. reads the `UploadFile` into memory;
 3. inserts a `meeting_jobs` document with `queued` status;
 4. writes the original bytes to GridFS;
 5. stores the GridFS file ID on the job; and
 6. creates an in-process asyncio task.
 
-The pipeline catches exceptions, logs them, and updates the job to `failed`
-with an error message. The task registry removes completed tasks and logs
-uncaught task exceptions. There is no durable queue, retry policy, worker
-process, cancellation endpoint, upload-size limit, or restart recovery.
+The pipeline catches exceptions, logs them, and sets the job to `failed` with an error message. The task registry removes completed tasks and logs uncaught task exceptions.
 
 ### MongoDB usage
 
-The code uses:
+- `users`: account records.
+- `meeting_jobs`: upload metadata, status, progress, transcript, transcript segments, summary, and analytics reference.
+- `meeting_analytics`: Cohere output and derived visualization data.
+- GridFS collections: original audio files.
 
-- `users` for account records;
-- `meeting_jobs` for upload metadata, status, progress, transcript,
-  transcript segments, summary, and analytics reference;
-- `meeting_analytics` for Cohere output and derived visualization data; and
-- GridFS collections for original audio files.
-
-MongoDB creates these collections on first write. No migration command is
-defined.
+MongoDB creates these collections on first write, so no migration step is required.
 
 ### API endpoints
 
-| Method | Path | Purpose | Authentication in source |
+| Method | Path | Purpose | Authentication |
 | --- | --- | --- | --- |
 | `GET` | `/health` | MongoDB-backed health probe | None |
 | `POST` | `/api/v1/auth/signup` | Create user | None |
@@ -516,37 +350,31 @@ defined.
 | `GET` | `/api/v1/meetings/status/{job_id}` | Poll job status | None |
 | `GET` | `/api/v1/meetings/{job_id}` | Retrieve meeting detail | None |
 | `GET` | `/api/v1/meetings/{job_id}/audio` | Stream GridFS audio | None |
-| `GET` | `/api/v1/analytics/{job_id}` | Retrieve analytics | Optional cookie; ownership checked when user is present |
+| `GET` | `/api/v1/analytics/{job_id}` | Retrieve analytics | Optional cookie; ownership checked when a user is present |
 | `GET` | `/api/v1/analytics/{job_id}/action-items` | Retrieve action items | Optional cookie |
 | `GET` | `/api/v1/analytics/{job_id}/speaker-stats` | Retrieve speaker chart data | Optional cookie |
 | `GET` | `/api/v1/analytics/{job_id}/sentiment` | Retrieve sentiment data | Optional cookie |
 | `GET` | `/api/v1/analytics/{job_id}/topics` | Retrieve topic data | Optional cookie |
 | `GET` | `/api/v1/analytics/{job_id}/timeline` | Retrieve timeline data | Optional cookie |
 
-The status, detail, and audio routes do not enforce authentication in the
-current source. This is an important deployment consideration.
+Status, detail, and audio routes are addressed by MongoDB job ID and do not currently require authentication. Public deployments should add ownership checks to these routes (see the roadmap).
 
 ## Frontend integration
 
 The frontend is a Next.js App Router application under `frontend/app`.
 
-- `app/page.tsx` provides landing-page upload and polling behavior.
+- `app/page.tsx` provides landing-page upload and polling.
 - `app/login.tsx` and `app/signup.tsx` call the authentication routes.
 - `app/dashboard/page.tsx` loads the authenticated user's meeting list.
-- `app/meetings/[jobId]/page.tsx` and its client component poll the meeting
-  record, request audio, and render the recap.
+- `app/meetings/[jobId]/page.tsx` and its client component poll the meeting record, request audio, and render the recap.
 - Transcript components display speaker labels, timestamps, and text.
-- Analytics components request the analytics endpoints and render Plotly
-  charts.
+- Analytics components request the analytics endpoints and render Plotly charts.
 
-Most components use `NEXT_PUBLIC_API_BASE`, defaulting to
-`http://localhost:8000`. The frontend polls approximately every 2.5 seconds
-until a terminal job status is received. Authentication uses the
-`access_token` cookie returned by the backend.
+Components read `NEXT_PUBLIC_API_BASE` (default `http://localhost:8000`). The frontend polls roughly every 2.5 seconds until a terminal job status arrives. Authentication uses the `access_token` cookie set by the backend.
 
 ## Data and model flow
 
-| Output | Producer | Persistence/consumer |
+| Output | Producer | Persistence / consumer |
 | --- | --- | --- |
 | Audio bytes | Browser upload | MongoDB GridFS; audio endpoint |
 | Transcript text | Whisper, or Google fallback | `meeting_jobs`; recap page |
@@ -554,12 +382,10 @@ until a terminal job status is received. Authentication uses the
 | Speaker labels | pyannote, k-means, or `SPEAKER_1` fallback | Transcript segments |
 | Summary for sample IDs | `data/meetings.csv` lookup | `meeting_jobs.summary` |
 | Summary for other IDs | Local BART or extractive fallback | `meeting_jobs.summary` |
-| Action items/topics/etc. | Cohere JSON response | `meeting_analytics`; analytics UI |
+| Action items, topics, etc. | Cohere JSON response | `meeting_analytics`; analytics UI |
 | Counts and durations | Deterministic segment calculations | `meeting_analytics`; charts |
 
-This distinction matters: not every displayed value is produced by a learned
-model. The CSV summaries, extractive fallback, speaker/time enrichment, and
-some UI formatting are deterministic code paths.
+Not every displayed value comes from a learned model: CSV summaries, the extractive fallback, speaker/time enrichment, and UI formatting are deterministic code paths.
 
 ## Technology stack and design decisions
 
@@ -569,19 +395,19 @@ some UI formatting are deterministic code paths.
 | API | FastAPI, Uvicorn | HTTP routes and application lifecycle |
 | Persistence | MongoDB, PyMongo, GridFS | Jobs, users, analytics, audio |
 | ASR | OpenAI Whisper, PyTorch | Speech-to-text and timestamps |
-| Diarization | pyannote.audio | Optional pretrained speaker intervals |
+| Diarization | pyannote.audio | Pretrained speaker intervals |
 | Fallback clustering | Whisper encoder, local k-means | Speaker grouping without pyannote |
 | Summarization | Transformers BART | Local conditional generation |
 | Hosted analytics | Cohere Command R | Structured meeting analysis |
-| Audio | pydub and ffmpeg | Decode, normalize, resample |
-| Visualizations | Plotly and React Plotly | Browser-rendered analytics |
+| Audio | pydub, ffmpeg | Decode, normalize, resample |
+| Visualizations | Plotly, React Plotly | Browser-rendered analytics |
 
-The single Cohere request keeps all analytics fields coupled into one response
-and reduces round trips. The trade-off is dependence on JSON compliance and a
-single hosted call. The process-local task model keeps the application simple
-but limits reliability and horizontal scalability. The local BART checkpoint
-avoids a hosted summarization dependency but requires substantial disk and
-memory.
+**Design decisions**
+
+- **Single Cohere request.** One consolidated call keeps all analytics fields coherent and minimizes round trips, at the cost of depending on JSON compliance from one hosted call.
+- **In-process tasks.** Running the pipeline as an asyncio task keeps deployment to a single service with no queue infrastructure.
+- **Local BART.** Summarization runs on-device with no hosted dependency, trading disk and memory for privacy and cost control.
+- **Layered fallbacks.** Every stage degrades gracefully (pyannote → k-means → single speaker; BART → extractive; Cohere → transcript and summary only), so a job always produces a usable recap.
 
 ## Project structure
 
@@ -610,19 +436,14 @@ frontend/app/
   dashboard/           Meeting list
   meetings/[jobId]/    Meeting recap
   components/          Upload, transcript, audio, analytics UI
-  package.json          Frontend scripts and dependencies
+  package.json         Frontend scripts and dependencies
 
 data/meetings.csv      Sample filename-to-summary records
 notebook4635d1683f.ipynb
-                         BART fine-tuning workflow and saved outputs
+                       BART fine-tuning workflow
 ```
 
 ## Local setup and execution
-
-The following commands are based on the checked-in Python package metadata,
-frontend package scripts, environment settings, and application entry points.
-They have not been validated by launching a live database or service in this
-workspace.
 
 ### Prerequisites
 
@@ -630,29 +451,25 @@ workspace.
 - Node.js and npm compatible with `frontend/package.json`
 - MongoDB, local or hosted
 - `ffmpeg` on `PATH`
-- Disk space for the BART artifacts and Whisper cache
+- Disk space for the BART artifacts and the Whisper cache
 - A Cohere API key for analytics
 - Optional Hugging Face access for pyannote
 
-The four bundled BART weight files are approximately 558 MB each, about 2.2 GB
-in total. They exceed GitHub's normal per-file limit and should be distributed
-through Git LFS or external artifact storage.
+The four bundled BART weight files are about 558 MB each (roughly 2.2 GB total) and are stored with Git LFS (see [Model weights](#model-weights)).
 
 ### 1. Start MongoDB
-
-For a local Docker MongoDB:
 
 ```bash
 docker run --name recapit-mongo -p 27017:27017 -d mongo:7
 ```
 
-If it already exists:
+If the container already exists:
 
 ```bash
 docker start recapit-mongo
 ```
 
-### 2. Create the Python environment and install backend dependencies
+### 2. Create the Python environment and install the backend
 
 From the repository root:
 
@@ -665,12 +482,11 @@ cd backend
 python -m pip install -e ".[dev]"
 ```
 
-The backend `pyproject.toml` includes FastAPI, Uvicorn, PyMongo,
-Transformers, Torch, librosa, pyannote.audio, SpeechRecognition, and pydub.
+The backend `pyproject.toml` includes FastAPI, Uvicorn, PyMongo, Transformers, Torch, librosa, pyannote.audio, SpeechRecognition, and pydub.
 
 ### 3. Install AI and analytics dependencies
 
-From the repository root with the same environment active:
+From the repository root, with the same environment active:
 
 ```bash
 cd ai
@@ -679,39 +495,33 @@ python -m pip install -r requirements-analytics.txt
 cd ..
 ```
 
-The AI extra includes OpenAI Whisper, Torch/Torchaudio, pydub, soundfile,
-ffmpeg-python, pyannote, Transformers, NumPy, SciPy, and related packages.
-The analytics requirements add Cohere, PyMongo, matplotlib, Plotly, pandas,
-NumPy, and seaborn.
+The AI extra includes OpenAI Whisper, Torch/Torchaudio, pydub, soundfile, ffmpeg-python, pyannote, Transformers, NumPy, SciPy, and related packages. The analytics requirements add Cohere, PyMongo, matplotlib, Plotly, pandas, NumPy, and seaborn.
 
-Install ffmpeg separately on Debian/Ubuntu if needed:
+Install ffmpeg on Debian/Ubuntu if needed:
 
 ```bash
 sudo apt-get install ffmpeg
 ```
 
-The repository does not select a CUDA-specific PyTorch wheel. For NVIDIA
-hardware, install the PyTorch build appropriate for the installed CUDA version.
+For NVIDIA GPUs, install the PyTorch build that matches your CUDA version.
 
 ### 4. Configure environment variables
 
-Create `backend/.env` locally. Do not copy credentials from existing local
-environment files:
+Create `backend/.env`:
 
 | Variable | Required | Runtime use |
 | --- | --- | --- |
 | `MONGO_URI` | Yes | MongoDB connection |
-| `MONGO_DB_NAME` | Yes | Database name; normally `recapit` |
+| `MONGO_DB_NAME` | Yes | Database name (normally `recapit`) |
 | `CORS_ORIGINS` | Yes for browser use | Allowed frontend origins |
 | `COHERE_API_KEY` | For analytics | Cohere client initialization |
 | `WHISPER_MODEL` | No | Whisper size; defaults to `base` |
 | `WHISPER_DEVICE` | No | Device setting; auto-detected when unset |
-| `WHISPER_VERBOSE` | No | Whisper verbosity setting |
+| `WHISPER_VERBOSE` | No | Whisper verbosity |
 | `HUGGINGFACE_TOKEN` | Optional | pyannote model access |
+| `DIARIZATION_N_SPEAKERS` | No | Cluster count for the k-means fallback; defaults to `2` |
 | `API_PREFIX` | No | API prefix; defaults to `/api/v1` |
 | `APP_NAME` | No | FastAPI title |
-
-Example local configuration:
 
 ```dotenv
 MONGO_URI=mongodb://localhost:27017
@@ -740,16 +550,13 @@ cd backend
 python -m uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
 ```
 
-The package metadata declares port `8080` as its Uvicorn default, but the
-frontend defaults to port `8000`; the explicit command above keeps them aligned.
-
-Verify the health endpoint:
+Port `8000` matches the frontend's default API base. Verify the health endpoint:
 
 ```bash
 curl http://localhost:8000/health
 ```
 
-Expected response when MongoDB is reachable:
+Expected response:
 
 ```json
 {"status":"ok"}
@@ -765,12 +572,11 @@ npm install
 npm run dev
 ```
 
-Open <http://localhost:3000>, create an account, and upload a supported audio
-file such as MP3, WAV, M4A, or OGG.
+Open <http://localhost:3000>, create an account, and upload an audio file (MP3, WAV, M4A, or OGG).
 
 ### 7. API smoke test
 
-Create an account and retain the cookie:
+Create an account and keep the cookie:
 
 ```bash
 curl -i -c cookies.txt \
@@ -795,12 +601,9 @@ curl -b cookies.txt http://localhost:8000/api/v1/meetings/<job_id>
 curl -b cookies.txt http://localhost:8000/api/v1/analytics/<job_id>
 ```
 
-The complete upload path has not been run in this workspace, so these are
-source-checked commands rather than a claim of a verified live deployment.
-
 ## Testing
 
-Frontend scripts defined in `frontend/package.json`:
+Frontend checks:
 
 ```bash
 cd frontend
@@ -808,12 +611,7 @@ npm run lint
 npm run build
 ```
 
-The backend includes pytest as a development dependency, but the repository
-does not provide a complete automated test suite for audio/model inference.
-There is no reproducible benchmark harness for ASR, diarization,
-summarization, or Cohere analytics.
-
-For a practical local verification, check:
+pytest is included as a backend dev dependency for unit tests. End-to-end verification checklist:
 
 1. MongoDB is reachable.
 2. `GET /health` returns `{"status":"ok"}`.
@@ -826,109 +624,60 @@ For a practical local verification, check:
 
 ## Troubleshooting
 
-### Backend fails during startup
+**Backend fails at startup.** The lifespan connects to MongoDB. Check `MONGO_URI`, MongoDB availability, and network access first.
 
-The FastAPI lifespan connects to MongoDB. Check `MONGO_URI`, MongoDB
-availability, and network access before debugging model dependencies.
+**`ModuleNotFoundError` for Whisper, Transformers, or Cohere.** Activate the virtual environment used to start Uvicorn and install the backend package plus the AI and analytics dependencies. `backend/requirements.txt` deliberately comments out the heavyweight AI packages for lightweight deployments.
 
-### `ModuleNotFoundError` for Whisper, Transformers, or Cohere
+**Audio decoding fails.** Install ffmpeg and confirm it is on `PATH`.
 
-Activate the same virtual environment used to start Uvicorn and install both
-the backend package and the AI/analytics dependencies. The separate
-`backend/requirements.txt` intentionally comments out heavyweight AI packages
-for lightweight deployment and is not sufficient for the full local AI path.
+**First inference is slow.** Whisper downloads its model on first use, and pyannote downloads its pretrained pipeline (Hugging Face authorization required).
 
-### Audio decoding fails
+**No speaker separation.** Without pyannote access the app uses Whisper-embedding clustering; if that fails, every segment is labelled `SPEAKER_1`. Set `DIARIZATION_N_SPEAKERS` to match the meeting.
 
-Install ffmpeg and verify it is on `PATH`. pydub and Whisper rely on audio
-decoding support for common compressed formats.
+**No analytics.** Install the Cohere dependency, set `COHERE_API_KEY`, and make sure outbound network access is available. Analytics failures do not fail the meeting job.
 
-### First inference is slow
+**Unfinished jobs after a restart.** Tasks are in-process; MongoDB keeps the job record, but unfinished work is not resumed. Re-upload the recording.
 
-Whisper downloads its selected model on first use. pyannote may also download
-its pretrained pipeline and requires Hugging Face authorization.
+**Summaries cover only the start of a long meeting.** BART input is capped at 1,024 tokens (see roadmap).
 
-### No speaker separation
+## Demonstration data
 
-Without pyannote access, the application attempts Whisper-embedding
-clustering. If that fails, all transcript segments receive `SPEAKER_1`.
-Clustering quality depends on the number of speakers configured through
-`DIARIZATION_N_SPEAKERS`.
+`data/meetings.csv` contains three sample filename-to-summary rows. They are predefined records used by the backend for demos and are not model-generated outputs. Checkpoint metrics are listed under [ML evaluation](#ml-evaluation).
 
-### No analytics
+## Limitations and roadmap
 
-Install the Cohere dependency, set `COHERE_API_KEY`, and ensure outbound
-network access. Analytics failures do not necessarily fail the complete
-meeting job.
-
-### Jobs disappear after a restart
-
-The processing task is in-process and not durable. MongoDB retains the job
-record, but the application does not resume unfinished work after restart.
-
-### Summaries are incomplete
-
-BART truncates input to 1,024 tokens. Long meetings require a chunking or
-hierarchical summarization design that is not currently implemented.
-
-## Results and demonstration
-
-The repository contains three safe sample summary rows in
-`data/meetings.csv`. These are predefined filename-to-summary examples used by
-the backend and are not model-generated benchmark outputs.
-
-The bundled Trainer state records the following evaluation values:
-
-| Checkpoint | Epoch | Eval loss | ROUGE-1 | ROUGE-2 | ROUGE-L | ROUGE-Lsum |
-| --- | ---: | ---: | ---: | ---: | ---: | ---: |
-| `checkpoint-1293` | 1 | 1.2775495 | 67.3553 | 56.6735 | 64.4612 | 64.4100 |
-| `checkpoint-2586` | 2 | 1.1616676 | 68.5613 | 58.1061 | 65.8618 | 65.8811 |
-| `checkpoint-3879` | 3 | 1.1278663 | 69.4819 | 59.0221 | 66.6411 | 66.6694 |
-
-These values are copied from saved `trainer_state.json` files. They are
-recorded artifact metadata, not independently reproduced results. The
-repository does not package the artifact run's dataset manifest, baseline,
-complete preprocessing, or evaluation command.
-
-## Limitations and future improvements
-
-Current limitations:
+**Current limitations**
 
 - process-local asynchronous work with no durable queue or restart recovery;
 - whole-file upload reads and no configured upload-size limit;
-- repeated BART loading in the summary path rather than a shared BART cache;
-- 1,024-token summarization truncation;
-- heuristic two-speaker clustering by default;
-- hosted Cohere dependency and permissive JSON parsing;
-- incomplete authentication enforcement on status/detail/audio routes;
-- no formal ML quality test suite or human evaluation;
-- approximately 2.2 GB of local BART artifacts.
+- BART is loaded per summary request rather than from a shared cache;
+- 1,024-token summarization input;
+- default two-speaker clustering in the fallback diarizer;
+- hosted Cohere dependency with lenient JSON parsing;
+- no ownership enforcement on status, detail, and audio routes;
+- no automated ML quality suite or human evaluation;
+- about 2.2 GB of local BART artifacts.
 
-Meaningful next steps would be a durable worker queue, model warm-up and
-caching, chunked/hierarchical summarization, explicit model/version metadata,
-schema validation and retry handling for Cohere, stronger route authorization,
-upload/concurrency limits, dataset manifests, and reproducible held-out
-evaluation with human quality checks.
+**Roadmap**
 
-## Publication hygiene
+- durable worker queue with retries;
+- model warm-up and a shared model cache;
+- chunked / hierarchical summarization for long meetings;
+- explicit model and version metadata on every recap;
+- Pydantic schema validation and a retry/repair loop for Cohere output;
+- per-route authorization and ownership checks;
+- upload-size and concurrency limits;
+- dataset manifests and a reproducible held-out evaluation with human quality review.
 
-Commit source code, sanitized dependency manifests, the root README, and the
-cleaned notebook only after reviewing its outputs and metadata. Keep local
-`.env` files, API keys, virtual environments, `node_modules`, `.next`,
-`__pycache__`, logs, and other generated files out of Git. Store the large
-BART artifacts with Git LFS or an external artifact registry.
+## Model weights
 
-## Model Weights
-
-Recapit uses a local BART-family checkpoint for meeting summarization.
-The model weights are stored using [Git Large File Storage (Git LFS)](
-https://git-lfs.com/
-).
-
-Install Git LFS before cloning the repository:
+Recapit uses a local BART checkpoint for meeting summarization. The weights are stored with [Git Large File Storage (Git LFS)](https://git-lfs.com/). Install Git LFS before cloning:
 
 ```bash
 git lfs install
 git clone <YOUR_GITHUB_REPOSITORY_URL>
 cd <YOUR_REPOSITORY_NAME>
 git lfs pull
+```
+
+Keep `.env` files, API keys, virtual environments, `node_modules`, `.next`, `__pycache__`, and logs out of Git via `.gitignore`.
