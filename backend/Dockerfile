@@ -26,6 +26,8 @@ RUN pip install --no-cache-dir --upgrade -r requirements.txt
 
 # Copy application code
 COPY --chown=user ./app /app/app
+COPY --chown=user ./ai/__init__.py /app/ai/__init__.py
+COPY --chown=user ./ai/pipeline /app/ai/pipeline
 COPY --chown=user ./.env.example /app/.env
 
 # Expose port 7860 (required by Hugging Face Spaces)

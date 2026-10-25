@@ -10,7 +10,7 @@ ML operating modes in one pipeline:
 - local Whisper speech recognition;
 - optional pretrained pyannote speaker diarization;
 - an unsupervised Whisper-embedding/k-means fallback;
-- local BART sequence-to-sequence summarization;
+- private Hugging Face BART sequence-to-sequence summarization;
 - hosted Cohere structured analysis;
 - deterministic post-processing for speaker and timing statistics; and
 - an asynchronous FastAPI/MongoDB application that exposes the results to a
@@ -56,7 +56,7 @@ flowchart LR
     ASR --> EMB[Whisper embeddings + k-means fallback]
     DIA --> SEG[Speaker-labelled segments]
     EMB --> SEG
-    SEG --> SUM[BART summarization]
+    SEG --> SUM[Hugging Face BART summarization]
     SUM --> EXT[Extractive fallback if needed]
     SUM --> LLM[Cohere Command R analytics]
     SEG --> LLM
@@ -76,8 +76,8 @@ flowchart LR
    100% while updating the job document.
 5. Whisper produces a transcript and timed segments.
 6. pyannote or the embedding fallback assigns speaker labels.
-7. The summary path uses the sample CSV lookup, BART, or an extractive
-   fallback.
+7. The summary path uses the private Hugging Face BART
+   model, or an extractive fallback.
 8. Cohere receives the transcript segments and summary, returns structured
    JSON, and deterministic speaker/time statistics are added.
 9. The transcript, segments, summary, analytics reference, and final status
@@ -184,31 +184,17 @@ labelled `SPEAKER_1`.
 
 ### 4. BART summarization
 
-The runtime loader in `ai/pipeline/summarizer.py` reads:
+The runtime loader in `ai/pipeline/summarizer.py` loads the private Hugging
+Face model `Neyati/recapit-meetingbank-bart`. The model is not bundled in this
+repository. Its weights are fetched at runtime using the Hugging Face token
+configured in `HUGGINGFACE_TOKEN`.
 
-```text
-ai/bart_model/kaggle/working/bart-meetingbank/
-```
-
-It instantiates `BartTokenizer` and `BartForConditionalGeneration` from the
-local directory. The bundled configuration identifies a BART-family model
-with:
-
-| Configuration | Value |
-| --- | ---: |
-| Encoder layers | 6 |
-| Decoder layers | 6 |
-| Hidden dimension (`d_model`) | 768 |
-| Encoder attention heads | 12 |
-| Decoder attention heads | 12 |
-| Vocabulary size | 50,265 |
-| Maximum position embeddings | 1,024 |
-| Weight dtype in config | float32 |
-
-The exact upstream model identifier is not stored in the artifact
-`_name_or_path` field. The notebook initializes `facebook/bart-base`, which
-matches the architecture class and scale, but the runtime artifact should be
-described as the supplied local BART-family checkpoint.
+The intended fine-tuned artifact is the `checkpoint-1938` export. The current
+application configuration supports an optional `SUMMARIZER_MODEL_REVISION`,
+but its default is empty, so deployment must set that variable if the
+repository's default revision is not already the intended export. The source
+does not independently verify that the private repository's default revision
+resolves to `checkpoint-1938`.
 
 #### Runtime preprocessing and generation
 
@@ -216,8 +202,18 @@ described as the supplied local BART-family checkpoint.
 - Input tokenization uses `max_length=1024` and `truncation=True`.
 - There is no chunk-and-aggregate strategy, so longer meetings lose content
   beyond the first 1,024 tokens.
-- Generation uses `max_length=150`, `min_length=40`, `num_beams=4`,
-  `length_penalty=2.0`, and `early_stopping=True`.
+- Generation uses `num_beams=4`, `max_new_tokens=256`,
+  `min_new_tokens=16`, `length_penalty=2.0`,
+  `no_repeat_ngram_size=3`, `early_stopping=True`, `do_sample=False`, and
+  `use_cache=True`.
+- The inherited generation configuration is copied and its `max_length` and
+  `min_length` values are cleared before the explicit new-token limits are
+  applied.
+- The model is loaded lazily once per process and protected by a lock so
+  concurrent jobs do not initialize duplicate copies.
+- Loading and generation are run in a worker thread from the async backend
+  pipeline. This prevents synchronous inference from directly blocking the
+  event loop, but it does not make CPU inference fast or make jobs durable.
 - The decoded sequence removes special tokens.
 
 #### Sample-specific and fallback behavior
@@ -228,7 +224,7 @@ and do not exercise BART.
 
 For other files:
 
-1. BART is loaded and called.
+1. The configured Hugging Face BART model is loaded and called.
 2. If loading or generation fails, the backend splits transcript lines and
    takes up to five early sentences as an extractive fallback.
 3. Very short or empty transcripts receive an explicit fallback message.
@@ -278,13 +274,13 @@ Pydantic schema validation or retry/repair loop for Cohere output.
 
 ### Training workflow present in the notebook
 
-The cleaned root notebook `notebook4635d1683f.ipynb` contains a full
-Hugging Face sequence-to-sequence workflow:
+The repository includes `meetingbank_bart_finetune_final.ipynb`, a Hugging
+Face sequence-to-sequence training notebook.
 
 1. Check for a GPU and install notebook packages.
 2. Mount Google Drive and define a model export directory.
 3. Load a dataset.
-4. Load `facebook/bart-base`.
+4. Load the BART base model used by the experiment.
 5. Tokenize source and target text.
 6. Configure ROUGE evaluation.
 7. Create `Seq2SeqTrainingArguments`.
@@ -292,37 +288,19 @@ Hugging Face sequence-to-sequence workflow:
 9. Call `trainer.train()`.
 10. Evaluate on the test split, generate an example, and save the model.
 
-The training code uses the standard encoder-decoder teacher-forcing objective
-implemented by Hugging Face's BART model and Trainer: decoder labels are
-compared with generated next-token predictions using token-level
-cross-entropy, and optimizer updates are applied during `trainer.train()`.
-The notebook does not implement a custom loss, LoRA adapter, or frozen-layer
-strategy.
+The training code uses the standard encoder-decoder teacher-forcing objective implemented by Hugging Face's BART model and Trainer. The decoder is trained against the target token labels using token-level cross-entropy, and optimizer updates are applied during `trainer.train()`. The notebook does not implement a custom loss, LoRA adapter, or frozen-layer strategy.
 
 ### Dataset and provenance
 
-The notebook first loads:
+The intended fine-tuning dataset for the deployed model is
+`huuuyeah/meetingbank`. The base model is `facebook/bart-large-xsum`, and the
+intended best checkpoint is `checkpoint-1938`, published in the private model
+repository above.
 
-```python
-load_dataset("edinburghcstr/ami", "ihm")
-```
-
-It falls back to `knkarthick/dialogsum`, then `samsum`, if earlier loading
-fails.
-
-In the saved AMI output, the columns were:
-
-```text
-meeting_id, audio_id, text, audio, begin_time, end_time,
-microphone_id, speaker_id
-```
-
-No summary column was present. The notebook's fallback therefore sets the
-target column equal to the transcript column. That is an input-to-itself
-target, not verified supervised meeting-summary data. The bundled artifact
-directory is named `bart-meetingbank`, but no dataset manifest connects it to
-MeetingBank or to this notebook. Dataset provenance for the bundled
-checkpoint is therefore unresolved.
+The repository does not contain a complete, independently reproducible
+training run or a local copy of the private model weights. Do not interpret
+the notebook outputs as proof that the current private model was reproduced
+by this application.
 
 ### Preprocessing and tokenization
 
@@ -330,13 +308,11 @@ The notebook's `preprocess_function`:
 
 - reads `examples[transcript_col]` as source text;
 - reads `examples[summary_col]` as target text;
-- tokenizes inputs with `max_length=1024`, truncation, and
-  `padding="max_length"`;
-- tokenizes targets with `max_length=256`, truncation, and
-  `padding="max_length"`;
+- tokenizes inputs with `max_length=1024` and truncation;
+- tokenizes targets with `max_length=256` and truncation;
 - stores target token IDs in `model_inputs["labels"]`;
-- maps over all dataset splits with `batched=True`, `num_proc=2`, and removes
-  the original columns.
+- maps over all dataset splits with `batched=True` and removes the original
+  columns. Padding is applied later by `DataCollatorForSeq2Seq`.
 
 ### Training configuration
 
@@ -344,58 +320,43 @@ The values explicitly configured in the notebook are:
 
 | Setting | Value |
 | --- | --- |
-| Base model in notebook | `facebook/bart-base` |
-| Output directory | `./results` |
+| Intended deployed base model | `facebook/bart-large-xsum` |
+| Intended fine-tuning dataset | `huuuyeah/meetingbank` |
+| Intended deployed checkpoint | `checkpoint-1938` |
+| Output directory | `DIRS["checkpoints"]` |
 | Evaluation strategy | `epoch` |
 | Save strategy | `epoch` |
-| Learning rate | `3e-5` |
-| Train batch size per device | `4` |
-| Evaluation batch size per device | `4` |
-| Epochs | `3` |
+| Learning rate | `2e-5` |
+| Train batch size per device | `1` |
+| Gradient accumulation | `8` |
+| Evaluation batch size per device | `2` |
+| Epochs | `4` |
 | Weight decay | `0.01` |
-| Warmup steps | `500` |
-| Generated evaluation | `predict_with_generate=True` |
-| Evaluation generation length | `256` |
-| Best-model metric | `rouge1`, higher is better |
+| Warmup | `warmup_ratio=0.05` |
+| Generated evaluation during training | `predict_with_generate=False` |
+| Best-model metric | `eval_loss`, lower is better |
+| Gradient checkpointing | enabled |
 | Mixed precision | `fp16=torch.cuda.is_available()` |
 | Checkpoint retention | `save_total_limit=2` |
-| Logging | `./logs`, every 100 steps, first step enabled |
+| Logging | every 50 steps |
 | External reporting | disabled (`report_to="none"`) |
-| Hub publishing | disabled (`push_to_hub=False`) |
+| Random seeds | configured `seed` and `data_seed` |
 
 The notebook does not explicitly name an optimizer or scheduler; it relies on
-Trainer defaults. The bundled artifact directories contain scheduler, scaler,
-and RNG state files, but those files do not establish every optimizer or
-hardware setting of the run that produced them.
+Trainer defaults. CUDA was available in the recorded Colab run, so fp16 was
+enabled for that run; this is not a deployment requirement.
 
-The saved notebook execution recorded a T4 GPU and a 108,502-row training
-split, then failed during `trainer.train()` with a `NoneType` sequence error.
-Its test evaluation and model export cells have no recorded outputs. The
-notebook therefore documents the intended fine-tuning workflow and
-configuration, not a verified successful reproducible run.
-
-### Bundled checkpoint artifacts
-
-The local BART directory contains:
-
-- root model weights and tokenizer files;
-- `checkpoint-1293`, `checkpoint-2586`, and `checkpoint-3879`;
-- `trainer_state.json`;
-- `training_args.bin`;
-- scheduler, scaler, and RNG state files; and
-- TensorBoard event files.
-
-The checkpoint states record 1,293, 2,586, and 3,879 global steps over three
-epochs. The root `model.safetensors` is byte-identical to
-`checkpoint-3879`; the earlier checkpoint weight files differ. This is
-consistent with a completed prior Trainer run, but the repository does not
-identify its exact dataset, command, machine, or relationship to the notebook.
+The notebook records `checkpoint-1938` as the best checkpoint at global step
+1,938, with a best validation loss of `1.020616`. The checkpoint was then
+loaded and its validation loss was recomputed as approximately `1.0204` in the
+notebook environment. These are notebook results, not a claim that this
+repository reproduces training.
 
 ### Loading for application inference
 
 The backend imports `load_bart_model()` when a filename is not found in the
-sample CSV. The tokenizer and model are loaded from the local artifact
-directory, then `generate_summary_with_bart()` applies the runtime generation
+sample CSV. The tokenizer and model are loaded from the private Hugging Face
+repository, then `generate_summary_with_bart()` applies the runtime generation
 settings described above. The application performs inference only; it does
 not call `Trainer.train()`, `model.train()`, `loss.backward()`, or an
 optimizer.
@@ -404,51 +365,29 @@ optimizer.
 
 ### Notebook metric implementation
 
-The notebook loads the `evaluate` ROUGE implementation and computes:
+The notebook loads the `evaluate` ROUGE implementation and computes
+ROUGE-1, ROUGE-2, ROUGE-L, and ROUGE-Lsum on the test evaluation path.
 
-- `rouge1`;
-- `rouge2`; and
-- `rougeL`.
+Predictions and labels are decoded with the BART tokenizer, special tokens are skipped, and `use_stemmer=True` is passed to `rouge.compute`. The notebook's official test evaluation computes deterministic per-example ROUGE means over all 862 test items. Generation uses `num_beams=4`, `max_new_tokens=256`, `min_new_tokens=16`, `length_penalty=2.0`, `no_repeat_ngram_size=3`, `early_stopping=True`, and `do_sample=False`. These are the official evaluation settings; the notebook's separate qualitative example uses different decoding settings.
 
-Predictions and labels are decoded with the BART tokenizer, special tokens
-are skipped, label padding IDs are filtered, and `use_stemmer=True` is passed
-to `rouge.compute`. The Trainer evaluates the validation split at each epoch
-and later contains code to evaluate `tokenized_dataset["test"]`.
+ROUGE-1 measures unigram overlap, ROUGE-2 measures bigram overlap, ROUGE-L
+measures longest-common-subsequence overlap, and ROUGE-Lsum is the
+summary-oriented variant reported by the evaluation output.
 
-ROUGE-1 measures unigram overlap, ROUGE-2 measures bigram overlap, and
-ROUGE-L measures longest-common-subsequence overlap. ROUGE-Lsum is also
-present in the saved Trainer state, although it is not returned explicitly by
-the cleaned notebook's `compute_metrics` return dictionary; its origin is not
-fully documented in the repository.
+### Recorded notebook evaluation
 
-### Recorded artifact values
+The saved notebook output reports the following scores on the 862-example
+MeetingBank test split:
 
-The following values are copied from the bundled
-`checkpoint-*/trainer_state.json` files:
+| Subset | ROUGE-1 | ROUGE-2 | ROUGE-L | ROUGE-Lsum |
+| --- | ---: | ---: | ---: | ---: |
+| All test examples | 71.30 | 61.06 | 68.47 | 69.08 |
+| Source at most 1,024 tokens (416 examples) | 72.07 | 61.92 | 69.18 | 69.69 |
+| Source over 1,024 tokens, truncated (446 examples) | 70.59 | 60.27 | 67.81 | 68.51 |
 
-| Checkpoint | Epoch | Eval loss | ROUGE-1 | ROUGE-2 | ROUGE-L | ROUGE-Lsum |
-| --- | ---: | ---: | ---: | ---: | ---: | ---: |
-| `checkpoint-1293` | 1 | 1.2775495 | 67.3553 | 56.6735 | 64.4612 | 64.4100 |
-| `checkpoint-2586` | 2 | 1.1616676 | 68.5613 | 58.1061 | 65.8618 | 65.8811 |
-| `checkpoint-3879` | 3 | 1.1278663 | 69.4819 | 59.0221 | 66.6411 | 66.6694 |
-
-These are recorded Trainer metadata values. They are not independently
-reproduced by this repository's current setup. The artifact state does not
-identify the evaluation dataset, baseline, exact preprocessing, or whether
-the values came from a clean held-out split.
-
-### Evaluation limitations
-
-- The notebook's observed AMI path lacks a summary field and falls back to
-  transcript-as-target behavior.
-- Source sequences are truncated at 1,024 tokens and target sequences at 256
-  tokens.
-- The artifact run's dataset and split procedure are not packaged.
-- No baseline comparison or human evaluation is included.
-- ROUGE measures lexical overlap, not factuality, coherence, faithfulness, or
-  usefulness of a meeting recap.
-- No repository test harness evaluates Whisper accuracy, diarization quality,
-  BART quality, or Cohere analytics quality.
+These are saved notebook outputs, not independently reproduced application
+benchmarks. The notebook also reports a validation smoke test, but labels it
+as sanity-only rather than a formal metric.
 
 ## Backend engineering
 
@@ -523,9 +462,6 @@ defined.
 | `GET` | `/api/v1/analytics/{job_id}/topics` | Retrieve topic data | Optional cookie |
 | `GET` | `/api/v1/analytics/{job_id}/timeline` | Retrieve timeline data | Optional cookie |
 
-The status, detail, and audio routes do not enforce authentication in the
-current source. This is an important deployment consideration.
-
 ## Frontend integration
 
 The frontend is a Next.js App Router application under `frontend/app`.
@@ -553,7 +489,7 @@ until a terminal job status is received. Authentication uses the
 | Segment timestamps | Whisper | `meeting_jobs.transcript_segments` |
 | Speaker labels | pyannote, k-means, or `SPEAKER_1` fallback | Transcript segments |
 | Summary for sample IDs | `data/meetings.csv` lookup | `meeting_jobs.summary` |
-| Summary for other IDs | Local BART or extractive fallback | `meeting_jobs.summary` |
+| Summary for other IDs | Private Hugging Face BART or extractive fallback | `meeting_jobs.summary` |
 | Action items/topics/etc. | Cohere JSON response | `meeting_analytics`; analytics UI |
 | Counts and durations | Deterministic segment calculations | `meeting_analytics`; charts |
 
@@ -571,7 +507,7 @@ some UI formatting are deterministic code paths.
 | ASR | OpenAI Whisper, PyTorch | Speech-to-text and timestamps |
 | Diarization | pyannote.audio | Optional pretrained speaker intervals |
 | Fallback clustering | Whisper encoder, local k-means | Speaker grouping without pyannote |
-| Summarization | Transformers BART | Local conditional generation |
+| Summarization | Transformers BART from Hugging Face Hub | Private conditional generation |
 | Hosted analytics | Cohere Command R | Structured meeting analysis |
 | Audio | pydub and ffmpeg | Decode, normalize, resample |
 | Visualizations | Plotly and React Plotly | Browser-rendered analytics |
@@ -579,9 +515,9 @@ some UI formatting are deterministic code paths.
 The single Cohere request keeps all analytics fields coupled into one response
 and reduces round trips. The trade-off is dependence on JSON compliance and a
 single hosted call. The process-local task model keeps the application simple
-but limits reliability and horizontal scalability. The local BART checkpoint
-avoids a hosted summarization dependency but requires substantial disk and
-memory.
+but limits reliability and horizontal scalability. The private BART model
+avoids storing weights in this repository but requires Hugging Face access,
+substantial memory, and a model cache.
 
 ## Project structure
 
@@ -589,7 +525,7 @@ memory.
 ai/
   pipeline/
     speech.py          Whisper, audio preprocessing, diarization, clustering
-    summarizer.py      BART loading and generation
+    summarizer.py      Hugging Face BART loading and generation
     analytics.py       Cohere prompt, parsing, storage, chart formatting
     extractor.py       Legacy fixed-value extractor
   bart_model/          BART model, tokenizer, checkpoints, Trainer metadata
@@ -613,7 +549,7 @@ frontend/app/
   package.json          Frontend scripts and dependencies
 
 data/meetings.csv      Sample filename-to-summary records
-notebook4635d1683f.ipynb
+meetingbank_bart_finetune_final.ipynb
                          BART fine-tuning workflow and saved outputs
 ```
 
@@ -630,13 +566,10 @@ workspace.
 - Node.js and npm compatible with `frontend/package.json`
 - MongoDB, local or hosted
 - `ffmpeg` on `PATH`
-- Disk space for the BART artifacts and Whisper cache
+- Disk space for the Hugging Face model cache and Whisper cache
 - A Cohere API key for analytics
-- Optional Hugging Face access for pyannote
-
-The four bundled BART weight files are approximately 558 MB each, about 2.2 GB
-in total. They exceed GitHub's normal per-file limit and should be distributed
-through Git LFS or external artifact storage.
+- A Hugging Face read token with access to the private summarizer repository
+  when using non-demo summaries
 
 ### 1. Start MongoDB
 
@@ -667,6 +600,8 @@ python -m pip install -e ".[dev]"
 
 The backend `pyproject.toml` includes FastAPI, Uvicorn, PyMongo,
 Transformers, Torch, librosa, pyannote.audio, SpeechRecognition, and pydub.
+The Docker-oriented `backend/requirements.txt` also installs the runtime
+`torch` and `transformers` packages needed by the summarizer.
 
 ### 3. Install AI and analytics dependencies
 
@@ -695,8 +630,9 @@ hardware, install the PyTorch build appropriate for the installed CUDA version.
 
 ### 4. Configure environment variables
 
-Create `backend/.env` locally. Do not copy credentials from existing local
-environment files:
+Create `backend/.env` for local backend development. This file is ignored by
+Git; never commit token or database values. The backend reads these settings
+through `backend/app/core/config.py`:
 
 | Variable | Required | Runtime use |
 | --- | --- | --- |
@@ -707,7 +643,9 @@ environment files:
 | `WHISPER_MODEL` | No | Whisper size; defaults to `base` |
 | `WHISPER_DEVICE` | No | Device setting; auto-detected when unset |
 | `WHISPER_VERBOSE` | No | Whisper verbosity setting |
-| `HUGGINGFACE_TOKEN` | Optional | pyannote model access |
+| `HUGGINGFACE_TOKEN` | For private summarizer/pyannote | Hugging Face read access |
+| `SUMMARIZER_MODEL_ID` | No | Defaults to `Neyati/recapit-meetingbank-bart` |
+| `SUMMARIZER_MODEL_REVISION` | Recommended | Optional revision; set to `checkpoint-1938` only if that is the revision exposed by the private repository |
 | `API_PREFIX` | No | API prefix; defaults to `/api/v1` |
 | `APP_NAME` | No | FastAPI title |
 
@@ -721,14 +659,20 @@ COHERE_API_KEY=replace-with-your-cohere-key
 WHISPER_MODEL=base
 WHISPER_DEVICE=auto
 WHISPER_VERBOSE=false
-HUGGINGFACE_TOKEN=replace-with-your-huggingface-token
+HUGGINGFACE_TOKEN=replace-with-a-read-token
+SUMMARIZER_MODEL_ID=Neyati/recapit-meetingbank-bart
+SUMMARIZER_MODEL_REVISION=
 ```
 
-Create `frontend/.env.local`:
+Create `frontend/.env.local` for the Next.js application:
 
 ```dotenv
 NEXT_PUBLIC_API_BASE=http://localhost:8000
 ```
+
+`NEXT_PUBLIC_API_BASE` is exposed to browser code, so it must contain only the
+backend URL and no credentials. The frontend appends `/api/v1` to this base
+for API requests.
 
 ### 5. Start the backend
 
@@ -798,6 +742,62 @@ curl -b cookies.txt http://localhost:8000/api/v1/analytics/<job_id>
 The complete upload path has not been run in this workspace, so these are
 source-checked commands rather than a claim of a verified live deployment.
 
+## Hugging Face Spaces deployment
+
+The backend includes a Docker configuration intended for a Hugging Face
+Docker Space. It listens on port `7860` and installs dependencies from
+`backend/requirements.txt`. The image does not contain model weights; the
+summarizer fetches them from the private Hugging Face model repository at
+runtime.
+
+The current [backend/Dockerfile](backend/Dockerfile) copies `app/` and the
+`ai/` pipeline code. Its build context must therefore include the repository
+root and the Dockerfile, for example:
+
+```bash
+docker build -f backend/Dockerfile -t recapit-backend .
+```
+
+The existing `backend/deploy_to_hf.sh` and
+`backend/HUGGINGFACE_DEPLOYMENT.md` copy only backend files into a Space.
+That documented copy flow does not currently provide the `ai/` directory
+expected by the Dockerfile and should not be treated as deployment-verified.
+Resolve that packaging mismatch before publishing a Space.
+
+Configure Hugging Face Space **Variables** for non-secret values:
+
+```text
+MONGO_DB_NAME=recapit
+CORS_ORIGINS=https://your-frontend-host
+SUMMARIZER_MODEL_ID=Neyati/recapit-meetingbank-bart
+SUMMARIZER_MODEL_REVISION=
+WHISPER_MODEL=base
+WHISPER_DEVICE=auto
+WHISPER_VERBOSE=false
+APP_NAME=Recapit API
+API_PREFIX=/api/v1
+```
+
+Configure Hugging Face Space **Secrets** for:
+
+```text
+MONGO_URI
+HUGGINGFACE_TOKEN
+COHERE_API_KEY
+```
+
+`HUGGINGFACE_TOKEN` must be a token with read permission for the private
+`Neyati/recapit-meetingbank-bart` repository. It may also be used for
+pyannote access when diarization is enabled. Do not put token values in the
+Dockerfile, `.env.example`, Space repository, frontend variables, or shell
+history.
+
+The current source does not verify the Space's RAM, disk quota, CPU/GPU
+availability, model download time, or CPU inference latency. BART-large
+inference can require substantial memory, and the first request may download
+the model into the Hugging Face cache. The process-local task model also does
+not resume jobs after a Space restart.
+
 ## Testing
 
 Frontend scripts defined in `frontend/package.json`:
@@ -808,10 +808,18 @@ npm run lint
 npm run build
 ```
 
-The backend includes pytest as a development dependency, but the repository
-does not provide a complete automated test suite for audio/model inference.
-There is no reproducible benchmark harness for ASR, diarization,
-summarization, or Cohere analytics.
+The focused summarizer tests are in
+`backend/tests/test_bart_summarizer_integration.py` and mock Hugging Face and
+PyTorch calls, so they do not download the private model. Run them from
+`backend/` after installing the backend development extra:
+
+```bash
+python -m pytest -q tests/test_bart_summarizer_integration.py
+```
+
+The repository does not provide a complete automated test suite or a
+reproducible benchmark harness for audio/model inference, ASR, diarization,
+summarization quality, or Cohere analytics.
 
 For a practical local verification, check:
 
@@ -833,10 +841,11 @@ availability, and network access before debugging model dependencies.
 
 ### `ModuleNotFoundError` for Whisper, Transformers, or Cohere
 
-Activate the same virtual environment used to start Uvicorn and install both
-the backend package and the AI/analytics dependencies. The separate
-`backend/requirements.txt` intentionally comments out heavyweight AI packages
-for lightweight deployment and is not sufficient for the full local AI path.
+Activate the same virtual environment used to start Uvicorn and install the
+backend package plus the AI/analytics extras. The Docker-oriented
+`backend/requirements.txt` includes `torch` and `transformers` for runtime
+summarization, but optional Whisper, diarization, and Cohere packages remain
+separate.
 
 ### Audio decoding fails
 
@@ -845,8 +854,18 @@ decoding support for common compressed formats.
 
 ### First inference is slow
 
-Whisper downloads its selected model on first use. pyannote may also download
-its pretrained pipeline and requires Hugging Face authorization.
+Whisper downloads its selected model on first use. The private BART model is
+also downloaded and cached on the first non-demo summary request. pyannote
+may download its pretrained pipeline and requires Hugging Face authorization.
+
+### Private BART model cannot be loaded
+
+Check that `SUMMARIZER_MODEL_ID` is exactly
+`Neyati/recapit-meetingbank-bart`, that `HUGGINGFACE_TOKEN` is present in the
+backend environment or Space Secrets, and that the token has read access to
+the private repository. If `SUMMARIZER_MODEL_REVISION` is set, verify that the
+revision exists in the model repository. Model-load failures intentionally use
+the extractive fallback.
 
 ### No speaker separation
 
@@ -877,18 +896,9 @@ The repository contains three safe sample summary rows in
 `data/meetings.csv`. These are predefined filename-to-summary examples used by
 the backend and are not model-generated benchmark outputs.
 
-The bundled Trainer state records the following evaluation values:
-
-| Checkpoint | Epoch | Eval loss | ROUGE-1 | ROUGE-2 | ROUGE-L | ROUGE-Lsum |
-| --- | ---: | ---: | ---: | ---: | ---: | ---: |
-| `checkpoint-1293` | 1 | 1.2775495 | 67.3553 | 56.6735 | 64.4612 | 64.4100 |
-| `checkpoint-2586` | 2 | 1.1616676 | 68.5613 | 58.1061 | 65.8618 | 65.8811 |
-| `checkpoint-3879` | 3 | 1.1278663 | 69.4819 | 59.0221 | 66.6411 | 66.6694 |
-
-These values are copied from saved `trainer_state.json` files. They are
-recorded artifact metadata, not independently reproduced results. The
-repository does not package the artifact run's dataset manifest, baseline,
-complete preprocessing, or evaluation command.
+The saved notebook output reports the test-set values in the evaluation
+section above. They are notebook results, not independently reproduced
+application benchmarks.
 
 ## Limitations and future improvements
 
@@ -896,13 +906,14 @@ Current limitations:
 
 - process-local asynchronous work with no durable queue or restart recovery;
 - whole-file upload reads and no configured upload-size limit;
-- repeated BART loading in the summary path rather than a shared BART cache;
+- private Hugging Face model access depends on a valid read token;
 - 1,024-token summarization truncation;
 - heuristic two-speaker clustering by default;
 - hosted Cohere dependency and permissive JSON parsing;
 - incomplete authentication enforcement on status/detail/audio routes;
 - no formal ML quality test suite or human evaluation;
-- approximately 2.2 GB of local BART artifacts.
+- unresolved RAM, disk-cache, and CPU-latency requirements for BART-large
+  inference.
 
 Meaningful next steps would be a durable worker queue, model warm-up and
 caching, chunked/hierarchical summarization, explicit model/version metadata,
@@ -912,23 +923,15 @@ evaluation with human quality checks.
 
 ## Publication hygiene
 
-Commit source code, sanitized dependency manifests, the root README, and the
-cleaned notebook only after reviewing its outputs and metadata. Keep local
-`.env` files, API keys, virtual environments, `node_modules`, `.next`,
-`__pycache__`, logs, and other generated files out of Git. Store the large
-BART artifacts with Git LFS or an external artifact registry.
+Commit source code, sanitized dependency manifests, this README, and the
+reviewed training notebook only after checking their outputs and metadata.
+Keep local `.env` files, API keys, virtual environments, `node_modules`,
+`.next`, `__pycache__`, logs, and generated caches out of Git. The private
+Hugging Face model is an external runtime dependency; do not make that model
+repository public and do not copy its weights into this repository.
 
-## Model Weights
-
-Recapit uses a local BART-family checkpoint for meeting summarization.
-The model weights are stored using [Git Large File Storage (Git LFS)](
-https://git-lfs.com/
-).
-
-Install Git LFS before cloning the repository:
-
-```bash
-git lfs install
-git clone <YOUR_GITHUB_REPOSITORY_URL>
-cd <YOUR_REPOSITORY_NAME>
-git lfs pull
+The historical local BART weights are ignored by `.gitignore`, while some
+configuration/tokenizer files remain in the worktree. They are not required
+by the current runtime loader and should be removed only in a separate,
+reviewed cleanup after the private model has been validated through the real
+pipeline. Do not perform a Git LFS migration as part of this integration.

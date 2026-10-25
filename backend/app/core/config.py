@@ -22,6 +22,8 @@ class Settings(BaseSettings):
     whisper_model: str = Field(default="base")  # tiny, base, small, medium, large
     whisper_device: str = Field(default="auto")  # cuda, cpu, or auto
     whisper_verbose: bool = Field(default=False)
+    summarizer_model_id: str = Field(default="Neyati/recapit-meetingbank-bart")
+    summarizer_model_revision: Optional[str] = Field(default=None)
 
     # Add this for analytics LLM
     cohere_api_key: Optional[str] = Field(default=None)
