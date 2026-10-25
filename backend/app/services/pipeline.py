@@ -386,6 +386,46 @@ def _lookup_summary_from_csv(meeting_id: str) -> str | None:
     return None
 
 
+def _generate_bart_summary_sync(
+    transcript: str,
+    model_id: str,
+    model_revision: str | None,
+    hf_token: str | None,
+) -> str:
+    import sys
+    from pathlib import Path as PathLib
+
+    services_file = PathLib(__file__).resolve()
+    ai_candidates = [
+        services_file.parents[3] / "ai",  # monorepo local run: <repo>/ai
+        services_file.parents[2] / "ai",  # container layout: /app/ai
+    ]
+    for ai_path in ai_candidates:
+        if ai_path.exists() and str(ai_path) not in sys.path:
+            sys.path.insert(0, str(ai_path))
+            break
+
+    from pipeline.summarizer import generate_summary_with_bart, load_bart_model
+
+    logger.info("Loading BART model for summarization (model_id=%s, revision=%s)", model_id, model_revision)
+    model, tokenizer = load_bart_model(
+        model_id=model_id,
+        model_revision=model_revision,
+        hf_token=hf_token,
+    )
+    if model is None or tokenizer is None:
+        logger.warning("BART model failed to load, falling back to extractive")
+        return ""
+
+    logger.info("Generating summary with BART model...")
+    summary = generate_summary_with_bart(transcript, model, tokenizer)
+    if summary:
+        logger.info("✅ BART summary generated: %s chars", len(summary))
+    else:
+        logger.warning("BART model returned empty summary, falling back to extractive")
+    return summary
+
+
 async def _summarise_transcript(transcript: str, filename: str = "") -> str:
     """Generate a summary from the transcript text.
     
@@ -406,31 +446,19 @@ async def _summarise_transcript(transcript: str, filename: str = "") -> str:
     
     # Use BART model for summarization
     try:
-        import sys
-        from pathlib import Path as PathLib
-        
-        # Add AI package to path
-        ai_path = PathLib(__file__).parent.parent.parent.parent / "ai"
-        if ai_path.exists() and str(ai_path) not in sys.path:
-            sys.path.insert(0, str(ai_path))
-        
-        from pipeline.summarizer import generate_summary_with_bart, load_bart_model
-        
-        logger.info("Loading BART model for summarization...")
-        model, tokenizer = load_bart_model()
-        
-        if model is not None and tokenizer is not None:
-            logger.info("Generating summary with BART model...")
-            summary = generate_summary_with_bart(transcript, model, tokenizer)
-            
-            if summary:
-                logger.info(f"✅ BART summary generated: {len(summary)} chars")
-                return summary
-            else:
-                logger.warning("BART model returned empty summary, falling back to extractive")
-        else:
-            logger.warning("BART model failed to load, falling back to extractive")
-    
+        from app.core.config import get_settings
+
+        settings = get_settings()
+        model_revision = settings.summarizer_model_revision or None
+        summary = await asyncio.to_thread(
+            _generate_bart_summary_sync,
+            transcript,
+            settings.summarizer_model_id,
+            model_revision,
+            settings.huggingface_token,
+        )
+        if summary:
+            return summary
     except Exception as e:
         logger.error(f"Error using BART model: {e}", exc_info=True)
         logger.info("Falling back to extractive summarization")
