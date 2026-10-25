@@ -921,17 +921,3 @@ schema validation and retry handling for Cohere, stronger route authorization,
 upload/concurrency limits, dataset manifests, and reproducible held-out
 evaluation with human quality checks.
 
-## Publication hygiene
-
-Commit source code, sanitized dependency manifests, this README, and the
-reviewed training notebook only after checking their outputs and metadata.
-Keep local `.env` files, API keys, virtual environments, `node_modules`,
-`.next`, `__pycache__`, logs, and generated caches out of Git. The private
-Hugging Face model is an external runtime dependency; do not make that model
-repository public and do not copy its weights into this repository.
-
-The historical local BART weights are ignored by `.gitignore`, while some
-configuration/tokenizer files remain in the worktree. They are not required
-by the current runtime loader and should be removed only in a separate,
-reviewed cleanup after the private model has been validated through the real
-pipeline. Do not perform a Git LFS migration as part of this integration.
